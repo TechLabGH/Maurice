@@ -1,6 +1,11 @@
+
 # Maurice
 
+<div align="center">
+	
 ![Maurice](Code/L_maurice.png)
+
+</div>
 
 Python task scheduler with GUI.
 Resides in system tray and runs python scripts based on Daily / Weekly and Monthly frequency.
@@ -66,3 +71,10 @@ It should have following structure
 
 ### Schedule file not found
 Make sure, there is schedules.json file in program's folder. Create it, if missing and init with [] brackets.
+
+## FAQ
+*Why is the program called Maurice?*
+
+Because even someone as great as King Julien needs helpers to take care of boring tasks. 🙂
+
+And seriously—it’s just a bit of internal, family humor.
