@@ -1,16 +1,1 @@
-[
-  {
-    "name": "test1",
-    "frequency": "Daily",
-    "next_run": "2027-01-01 01:00",
-    "filepath": "C:/Users/David/Desktop/Maurice/test.py",
-    "last_run": "1900-01-01 00:00"
-  },
-  {
-    "name": "Task2",
-    "frequency": "Weekly",
-    "next_run": "2027-01-01 02:00",
-    "filepath": "C:/Users/David/Desktop/Maurice/test.py",
-    "last_run": "1900-01-01 00:00"
-  }
-]
+[]

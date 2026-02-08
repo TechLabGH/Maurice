@@ -1,45 +1,286 @@
+import os
+import sys
+import json
+import threading
+import subprocess
+from pathlib import Path
+from datetime import datetime, timedelta
+
 import tkinter as tk
 from tkinter import END, ttk, filedialog, messagebox
+
 from pystray import Icon, Menu, MenuItem
-from datetime import datetime
-import numpy as np
-import threading
-import time
-import os
-import json
-import subprocess
-import sys
-import signal
 from PIL import Image, ImageTk
 
-SCHEDULE_FILE = "schedules.json"
-LOG_FILE = "log.txt"
+
+# ----------------------------
+# Constants / Files
+# ----------------------------
+APP_TITLE = "Maurice"
+SCHEDULE_FILE = Path("schedules.json")
+LOG_FILE = Path("log.txt")
+
+DT_FORMAT = "%Y-%m-%d %H:%M"
 
 tray_icon = None
+_tray_img_small = None
+_tray_img_large = None
 
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def log_line(msg: str) -> None:
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+            g_71.insert(tk.END, f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+            g_71.see(tk.END)
+    except Exception:
+        pass
+
+
+def parse_dt(s: str) -> datetime:
+    return datetime.strptime(s.strip(), DT_FORMAT)
+
+
+def fmt_dt(dt: datetime) -> str:
+    return dt.strftime(DT_FORMAT)
+
+
+def atomic_write_json(path: Path, data) -> None:
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_json_list(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    raw = path.read_text(encoding="utf-8")
+    if not raw.strip():
+        return []
+    data = json.loads(raw)
+    return data if isinstance(data, list) else []
+
+
+def short_path(p: str, max_len: int = 35) -> str:
+    p = p or ""
+    if len(p) <= max_len:
+        return p
+    base = os.path.basename(p)
+    if len(base) >= max_len:
+        return base[: max_len - 1] + "…"
+    tail_len = max_len - len(base) - 1
+    return f"{base}…{p[-tail_len:]}"
+
+
+def add_month(dt: datetime) -> datetime:
+    y, m = dt.year, dt.month
+    m += 1
+    if m == 13:
+        y += 1
+        m = 1
+
+    # last day of new month
+    if m == 12:
+        first_next = datetime(y + 1, 1, 1)
+    else:
+        first_next = datetime(y, m + 1, 1)
+    last_day = (first_next - timedelta(days=1)).day
+
+    day = min(dt.day, last_day)
+    return dt.replace(year=y, month=m, day=day)
+
+
+def compute_next_run(prev_scheduled: datetime, frequency: str) -> datetime:
+    """
+    IMPORTANT: advance based on the scheduled time (prev_scheduled), not now,
+    so cadence stays the same even if runs were delayed/missed.
+    """
+    f = (frequency or "").strip().lower()
+    if f == "daily":
+        return prev_scheduled + timedelta(days=1)
+    if f == "weekly":
+        return prev_scheduled + timedelta(days=7)
+    if f == "monthly":
+        return add_month(prev_scheduled)
+    # default fallback
+    return prev_scheduled + timedelta(days=1)
+
+
+def run_script(filepath: str) -> None:
+    try:
+        subprocess.Popen(
+            [sys.executable, filepath],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log_line(f"Started: {filepath}")
+    except Exception as e:
+        log_line(f"Failed to start {filepath}: {e}")
+
+
+# ----------------------------
+# Catch-up missed tasks (ON OPEN)
+# ----------------------------
+def catch_up_missed_tasks(schedules: list[dict]) -> tuple[list[dict], bool]:
+    """
+    If next_run < now:
+      - run the task ONCE immediately
+      - set last_run to now
+      - advance next_run forward in steps from the original next_run until it's in the future
+        (cadence behaves as if runs were never missed)
+    """
+    now = datetime.now()
+    changed = False
+
+    for job in schedules:
+        if not isinstance(job, dict):
+            continue
+
+        name = str(job.get("name", "")).strip()
+        frequency = str(job.get("frequency", "")).strip()
+        next_run_s = str(job.get("next_run", "")).strip()
+        filepath = str(job.get("filepath", "")).strip()
+
+        if not (name and frequency and next_run_s and filepath):
+            continue
+        if not Path(filepath).exists():
+            continue
+
+        try:
+            scheduled = parse_dt(next_run_s)
+        except Exception:
+            continue
+
+        if scheduled < now:
+            # Run ONCE now because it was missed
+            run_script(filepath)
+            job["last_run"] = fmt_dt(now)
+
+            # Advance next_run as if it kept running on schedule:
+            # step from the scheduled time until next_run is in the future.
+            nxt = scheduled
+            while nxt <= now:
+                nxt = compute_next_run(nxt, frequency)
+
+            job["next_run"] = fmt_dt(nxt)
+            changed = True
+
+    return schedules, changed
+
+
+# ----------------------------
+# Scheduler Thread
+# ----------------------------
+class SimpleScheduler:
+    def __init__(self):
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                self.tick()
+            except Exception as e:
+                log_line(f"Scheduler tick error: {e}")
+            self._stop.wait(1.0)
+
+    def tick(self):
+        with self._lock:
+            schedules = read_json_list(SCHEDULE_FILE)
+
+        now = datetime.now()
+        changed = False
+
+        for job in schedules:
+            if not isinstance(job, dict):
+                continue
+
+            name = str(job.get("name", "")).strip()
+            frequency = str(job.get("frequency", "")).strip()
+            next_run_s = str(job.get("next_run", "")).strip()
+            filepath = str(job.get("filepath", "")).strip()
+
+            if not (name and frequency and next_run_s and filepath):
+                continue
+            if not Path(filepath).exists():
+                continue
+
+            try:
+                next_run = parse_dt(next_run_s)
+            except Exception:
+                continue
+
+            # Due now
+            if next_run <= now:
+                run_script(filepath)
+                job["last_run"] = fmt_dt(now)
+
+                # Keep cadence based on scheduled time
+                nxt = compute_next_run(next_run, frequency)
+                # If we were behind a while, advance until in the future (but only run once)
+                while nxt <= now:
+                    nxt = compute_next_run(nxt, frequency)
+
+                job["next_run"] = fmt_dt(nxt)
+                changed = True
+
+        if changed:
+            with self._lock:
+                atomic_write_json(SCHEDULE_FILE, schedules)
+
+
+scheduler = SimpleScheduler()
+
+
+# ----------------------------
+# GUI
+# ----------------------------
 root = tk.Tk()
-root.title("Maurice")
+root.title(APP_TITLE)
 root.geometry("600x345")
 root.resizable(False, False)
+
+schedule: list[dict] = []
+
+
+def load_images_once():
+    global _tray_img_small, _tray_img_large
+    try:
+        if _tray_img_small is None:
+            _tray_img_small = Image.open("maurice.png").resize((64, 64))
+        if _tray_img_large is None:
+            _tray_img_large = Image.open("L_maurice.png").resize((50, 50))
+    except Exception as e:
+        log_line(f"Image load error: {e}")
 
 
 def minimize_to_tray():
     global tray_icon
 
-    # Don't create multiple tray icons if minimized more than once
     if tray_icon is not None:
         root.withdraw()
         return
 
+    load_images_once()
     root.withdraw()
 
     def on_exit(icon, item):
         try:
-            if scheduler.running:
-                scheduler.shutdown(wait=False)
+            scheduler.stop()
         except Exception as e:
-            with open(LOG_FILE, "a", encoding="utf-8") as log:
-                log.write(f"[{datetime.now()}] Scheduler shutdown error: {e}\n")
+            log_line(f"Scheduler stop error: {e}")
 
         try:
             icon.visible = False
@@ -47,33 +288,26 @@ def minimize_to_tray():
         except Exception:
             pass
 
-        # Clean shutdown of Tk
         try:
             root.after(0, root.destroy)
         except Exception:
             pass
 
-        # Hard exit to ensure background threads/processes stop
         os._exit(0)
 
     def show_window(icon, item):
         global tray_icon
-        # Restore Tk window on the Tk thread
         root.after(0, root.deiconify)
         root.after(0, root.lift)
         root.after(0, root.focus_force)
-
-        # Remove tray icon
         try:
             icon.visible = False
             icon.stop()
         except Exception:
             pass
-
         tray_icon = None
 
-    # Build tray image
-    image = Image.open("maurice.png").resize((64, 64))
+    image = _tray_img_small if _tray_img_small is not None else Image.new("RGBA", (64, 64), (0, 0, 0, 0))
 
     tray_icon = Icon(
         "Maurice",
@@ -83,25 +317,23 @@ def minimize_to_tray():
             MenuItem("Exit", on_exit),
         ),
     )
-
-    # More reliable than manually threading tray_icon.run()
     tray_icon.run_detached()
 
+
 def open_about_window():
-    # Prevent multiple About windows
     if hasattr(open_about_window, "window") and open_about_window.window.winfo_exists():
         open_about_window.window.lift()
         return
 
+    load_images_once()
+
     about = tk.Toplevel(root)
     open_about_window.window = about
-
     about.title("About Maurice")
     about.resizable(False, False)
     about.transient(root)
-    about.grab_set()  # modal behavior
+    about.grab_set()
 
-    # Center the window
     width, height = 420, 300
     x = root.winfo_x() + (root.winfo_width() // 2) - (width // 2)
     y = root.winfo_y() + (root.winfo_height() // 2) - (height // 2)
@@ -110,43 +342,29 @@ def open_about_window():
     container = tk.Frame(about, padx=20, pady=20)
     container.pack(fill="both", expand=True)
 
-    # Load graphic
-    
-    img = Image.open("L_maurice.png").resize((50, 50))
-    photo = ImageTk.PhotoImage(img)
-    logo = tk.Label(container, image=photo)
-    logo.image = photo  # keep reference
-    logo.pack(pady=(0, 10))
+    if _tray_img_large is not None:
+        photo = ImageTk.PhotoImage(_tray_img_large)
+        logo = tk.Label(container, image=photo)
+        logo.image = photo
+        logo.pack(pady=(0, 10))
 
-    # Text content
+    tk.Label(container, text="Maurice", font=("Segoe UI", 16, "bold")).pack()
     tk.Label(
         container,
-        text="Maurice",
-        font=("Segoe UI", 16, "bold"),
-    ).pack()
-
-    tk.Label(
-        container,
-        text="A lightweight background python task scheduler\nMinimalize to system tray.",
+        text="A lightweight background python task scheduler\nMinimize to system tray.",
         justify="center",
         wraplength=360,
         pady=10,
     ).pack()
-
     tk.Label(
         container,
-        text="Version 1.0\n© 2026 Maurice Project\nAuthor: David Z",
+        text="Version 2.1\n© 2026 Maurice Project\nAuthor: David Z",
         font=("Segoe UI", 9),
         fg="gray",
         pady=10,
     ).pack()
+    tk.Button(container, text="Close", width=10, command=about.destroy).pack(pady=(10, 0))
 
-    tk.Button(
-        container,
-        text="Close",
-        width=10,
-        command=about.destroy,
-    ).pack(pady=(10, 0))
 
 def browse_file():
     path = filedialog.askopenfilename(filetypes=[("Script Files", "*.py *.pyw")])
@@ -154,143 +372,180 @@ def browse_file():
         g_44.delete(0, tk.END)
         g_44.insert(0, path)
 
+
 def open_log():
-    #use os default program to open txt file
-    os.startfile(LOG_FILE)
+    try:
+        os.startfile(str(LOG_FILE))
+    except Exception as e:
+        messagebox.showerror("Error", f"Could not open log file:\n{e}")
+
 
 def open_readme():
-    #use os default program to open txt file
-    os.startfile("readme.txt")
+    try:
+        os.startfile("readme.txt")
+    except Exception as e:
+        messagebox.showerror("Error", f"Could not open readme.txt:\n{e}")
+
 
 def open_config():
-    #use os default program to open json file
-    os.startfile(SCHEDULE_FILE)
-
-    if os.path.exists(SCHEDULE_FILE):
-        try:
-            with open(SCHEDULE_FILE, "r") as f:
-                data = json.load(f)
-            for job in data:
-                if all(k in job for k in ("frequency", "datetime", "filepath")):
-                    try:
-                        datetime.strptime(job["datetime"], "%Y-%m-%d %H:%M")
-                        schedule_task(job["frequency"], job["datetime"], job["filepath"])
-                    except Exception as e:
-                        with open(LOG_FILE, "a") as log_file:
-                            log_file.write(f"[{datetime.now()}] Skipped invalid job: {job}, Reason: {e}\n")
-        except Exception as e:
-            with open(LOG_FILE, "a") as log_file:
-                log_file.write(f"[{datetime.now()}] Failed to load jobs: {e}\n")
-
-def add_schedule_to_file():
-    # read entry values
-    name = g_14.get()
-    frequency = g_24.get()
-    dt = g_34.get()
-    filepath = g_44.get()
-
-    # first run time needs to be in the future
-    if dt < datetime.now().strftime("%Y-%m-%d %H:%M"):
-        messagebox.showerror("Error", "Start time must be in the future.")
+    try:
+        if not SCHEDULE_FILE.exists():
+            atomic_write_json(SCHEDULE_FILE, [])
+        os.startfile(str(SCHEDULE_FILE))
+    except Exception as e:
+        messagebox.showerror("Error", f"Could not open config:\n{e}")
         return
 
-    # all firlds need to be filled
-    if not frequency or not dt or not filepath or not name:
+    load_schedules()
+
+
+def load_schedules():
+    """Loads schedules into `schedule` and refreshes combobox. Shows popups if invalid."""
+    global schedule
+    try:
+        data = read_json_list(SCHEDULE_FILE)
+    except Exception:
+        messagebox.showerror("Error", "schedules.json is invalid JSON.\nFix it or recreate it.")
+        schedule = []
+        g_11.set("")
+        g_11["values"] = ()
+        return
+
+    normalized: list[dict] = []
+    for job in data:
+        if not isinstance(job, dict):
+            continue
+        if not all(k in job for k in ("name", "frequency", "next_run", "filepath", "last_run")):
+            continue
+        try:
+            parse_dt(str(job["next_run"]))
+        except Exception:
+            continue
+        try:
+            parse_dt(str(job["last_run"]))
+        except Exception:
+            job["last_run"] = "1900-01-01 00:00"
+        normalized.append(job)
+
+    schedule = normalized
+    g_11["values"] = tuple(task["name"] for task in schedule)
+
+
+def load_schedules_silent():
+    """Like load_schedules(), but no popups (safe to call repeatedly)."""
+    global schedule
+    try:
+        data = read_json_list(SCHEDULE_FILE)
+    except Exception:
+        schedule = []
+        g_11["values"] = ()
+        return
+
+    normalized: list[dict] = []
+    for job in data:
+        if not isinstance(job, dict):
+            continue
+        if not all(k in job for k in ("name", "frequency", "next_run", "filepath", "last_run")):
+            continue
+        try:
+            parse_dt(str(job["next_run"]))
+        except Exception:
+            continue
+        try:
+            parse_dt(str(job["last_run"]))
+        except Exception:
+            job["last_run"] = "1900-01-01 00:00"
+        normalized.append(job)
+
+    schedule = normalized
+    g_11["values"] = tuple(task["name"] for task in schedule)
+
+
+def add_schedule_to_file():
+    name = g_14.get().strip()
+    frequency = g_24.get().strip()
+    dt_str = g_34.get().strip()
+    filepath = g_44.get().strip()
+
+    if not name or not frequency or not dt_str or not filepath:
         messagebox.showerror("Error", "Please fill in all fields.")
         return
 
-    data = {"name": name, "frequency": frequency, "next_run": dt, "filepath": filepath, "last_run": "1900-01-01 00:00"}
-    print(data)
+    try:
+        next_run_dt = parse_dt(dt_str)
+    except ValueError:
+        messagebox.showerror("Error", f"Start time must match: {DT_FORMAT}")
+        return
 
-    #read current schedule    
-    if os.path.exists(SCHEDULE_FILE):
-        with open(SCHEDULE_FILE, "r") as f:
-            existing = json.load(f)
-    else:
+    if next_run_dt <= datetime.now():
+        messagebox.showerror("Error", "Start time must be in the future.")
+        return
+
+    if not Path(filepath).exists():
+        messagebox.showerror("Error", "Selected script path does not exist.")
+        return
+
+    new_task = {
+        "name": name,
+        "frequency": frequency,
+        "next_run": fmt_dt(next_run_dt),
+        "filepath": filepath,
+        "last_run": "1900-01-01 00:00",
+    }
+
+    try:
+        existing = read_json_list(SCHEDULE_FILE)
+    except Exception:
         existing = []
 
-    #add new entry
-    existing.append(data)
+    if any(isinstance(t, dict) and t.get("name") == name for t in existing):
+        messagebox.showerror("Error", "A task with that name already exists.")
+        return
 
-    #sabe back to file
-    with open(SCHEDULE_FILE, "w") as f:
-        f.truncate()
-        json.dump(existing, f, indent=2)
-        f.close()
-    
-    # clear entries
+    existing.append(new_task)
+
+    try:
+        atomic_write_json(SCHEDULE_FILE, existing)
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to save schedules.json:\n{e}")
+        return
+
     g_14.delete(0, END)
-    g_14.insert(0, "")
-    g_24.delete(0, END)
-    g_24.insert(0, "")
+    g_24.set("")
     g_34.delete(0, END)
     g_34.insert(0, "YYYY-MM-DD HH:MM")
     g_44.delete(0, END)
-    g_44.insert(0, "")
 
-    # refresh combobox with newly added schedule
     load_schedules()
 
-def load_schedules():
-    # check if schedule file exists
-    if os.path.exists(SCHEDULE_FILE):
-        with open(SCHEDULE_FILE, "r") as f:
-            sched_json = json.load(f)
-            
-            # clear current schedule
-            schedule.clear()
 
-            # parse json into schedule array
-            for tasks in sched_json:
-                schedule.append(tasks)
-            
-            # array is empty - nothing loaded
-            if np.shape(schedule)[0] == 0:
-                messagebox.showinfo("Info", "Schedule file is empty or has broken structure")
-                return
-    # schedule fine not found
-    else:
-        messagebox.showinfo("Error", "Schedule file not found.\nPlease create it manually.\nSee readme for details.")
+def task_selected(_event=None):
+    sel = g_11.get().strip()
+    if not sel:
         return
-    
-    # at least one task loaded to array - update combobox
-    if np.shape(schedule)[0] > 0:
-        #clear selected task from combobox
-        g_11.set("")
-        #delete all current values
-        g_11['values'] = ()
-        #add new values from schedule array
-        g_11['values'] = [task["name"] for task in schedule]
+    for row in schedule:
+        if row.get("name") == sel:
+            g_22.config(text=row.get("frequency", "---"))
+            g_32.config(text=row.get("next_run", "---"))
+            g_42.config(text=short_path(row.get("filepath", "---")))
+            g_52.config(text=row.get("last_run", "---"))
+            return
 
-def task_selected(x):
-    # convert to numpy array for easier handling
-    sched_ar = np.array(schedule)
-    sel_task = g_11.get()
-    for row in sched_ar:
-        if row["name"] == sel_task:
-            g_22.config(text=row["frequency"])
-            g_32.config(text=row["next_run"])
-            g_42.config(text="..." + row["filepath"][-25:])
-            g_52.config(text=row["last_run"])
-            break
-    
+
 def delete_task():
-    sel_task = g_11.get()
-    if not sel_task:
+    sel = g_11.get().strip()
+    if not sel:
         messagebox.showerror("Error", "No task selected.")
         return
 
-    # Remove from schedule array
-    global schedule
-    schedule = [task for task in schedule if task["name"] != sel_task]
+    new_list = [t for t in schedule if t.get("name") != sel]
 
-    # Save updated schedule to file
-    with open(SCHEDULE_FILE, "w") as f:
-        f.truncate()
-        json.dump(schedule, f, indent=2)
-        f.close()
+    try:
+        atomic_write_json(SCHEDULE_FILE, new_list)
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to update schedules.json:\n{e}")
+        return
 
-    # Refresh combobox and clear details
     load_schedules()
     g_22.config(text="---")
     g_32.config(text="---")
@@ -298,99 +553,142 @@ def delete_task():
     g_52.config(text="---")
 
 
+def refresh_selected_task_ui():
+    """Periodic UI refresh so g_32/g_52 reflect latest run times."""
+    sel = g_11.get().strip()
+
+    load_schedules_silent()
+
+    if sel:
+        for row in schedule:
+            if row.get("name") == sel:
+                g_22.config(text=row.get("frequency", "---"))
+                g_32.config(text=row.get("next_run", "---"))
+                g_42.config(text=short_path(row.get("filepath", "---")))
+                g_52.config(text=row.get("last_run", "---"))
+                break
+
+    root.after(1000, refresh_selected_task_ui)
 
 
-
-
-# --- GUI Layout ---
-
-# Menu Bar
+# ----------------------------
+# Menu + Layout
+# ----------------------------
 menubar = tk.Menu(root)
 file_menu = tk.Menu(menubar, tearoff=0)
-file_menu.add_command(label="Open log",         command=open_log)
-file_menu.add_command(label="Open config",      command=open_config)
+file_menu.add_command(label="Open log", command=open_log)
+file_menu.add_command(label="Open config", command=open_config)
 file_menu.add_separator()
 file_menu.add_command(label="Minimize to tray", command=minimize_to_tray)
-file_menu.add_command(label="Exit",             command=root.destroy)
+file_menu.add_command(label="Exit", command=root.destroy)
 menubar.add_cascade(label="File", menu=file_menu)
-about = tk.Menu(menubar, tearoff=0)
-about.add_command(label="Readme",                command=open_readme)
-about.add_command(label="About Maurice",         command=open_about_window)
-menubar.add_cascade(label="Help", menu=about)
+
+help_menu = tk.Menu(menubar, tearoff=0)
+help_menu.add_command(label="Readme", command=open_readme)
+help_menu.add_command(label="About Maurice", command=open_about_window)
+menubar.add_cascade(label="Help", menu=help_menu)
+
 root.config(menu=menubar)
 
-# Main window
-g_11 = ttk.Combobox(root, values=[]                            , width=36)
+g_11 = ttk.Combobox(root, values=[], width=36)
 g_11.bind("<<ComboboxSelected>>", task_selected)
-g_13 = tk.Label(root, text="Add new:"                          , width=8)
+
+g_13 = tk.Label(root, text="Add new:", width=8)
 g_14 = tk.Entry(root)
-g_21 = tk.Label(root, text="Frequency:"                        , width=8)
-g_22 = tk.Label(root, text="---", anchor="w"                   , width=28)
-g_23 = tk.Label(root, text="Frequency:"                        , width=8)
+
+g_21 = tk.Label(root, text="Frequency:", width=8)
+g_22 = tk.Label(root, text="---", anchor="w", width=28)
+
+g_23 = tk.Label(root, text="Frequency:", width=8)
 g_24 = ttk.Combobox(root, values=["Daily", "Weekly", "Monthly"], width=28)
-g_31 = tk.Label(root, text="Start:"                            , width=8)
-g_32 = tk.Label(root, text="---", anchor="w"                   , width=28)
-g_33 = tk.Label(root, text="Start:"                            , width=8)
+
+g_31 = tk.Label(root, text="Start:", width=8)
+g_32 = tk.Label(root, text="---", anchor="w", width=28)
+
+g_33 = tk.Label(root, text="Start:", width=8)
 g_34 = tk.Entry(root, justify="left")
 g_34.insert(0, "YYYY-MM-DD HH:MM")
-g_41 = tk.Label(root, text="Path:"                             , width=8)
-g_42 = tk.Label(root, text="---", anchor="w"                   , width=28)
-g_43 = tk.Label(root, text="Path:"                             , width=8)
+
+g_41 = tk.Label(root, text="Path:", width=8)
+g_42 = tk.Label(root, text="---", anchor="w", width=28)
+
+g_43 = tk.Label(root, text="Path:", width=8)
 g_44 = tk.Entry(root)
-g_45 = tk.Button(root, text="..."                              , width=4, command=browse_file)
-g_51 = tk.Label(root, text="Last run:"                         , width=8)
-g_52 = tk.Label(root, text="---", anchor="w"                   , width=28)
-g_61 = tk.Button(root, text="Delete"                           , width=8, command=delete_task)
-g_63 = tk.Button(root, text="Save"                             , width=8, command=add_schedule_to_file)
-g_71 = tk.Text(root, height=4                                  , width=72)
+g_45 = tk.Button(root, text="...", width=4, command=browse_file)
 
-g_11.grid(row=0, column=0, padx=10, pady=10, sticky="w",  columnspan=2, ipadx=0, ipady=0)
-g_13.grid(row=0, column=2, padx=10, pady=10, sticky="w",                ipadx=0, ipady=0)
-g_14.grid(row=0, column=3, padx=10, pady=10, sticky="ew", columnspan=2, ipadx=0, ipady=0)
-g_21.grid(row=1, column=0, padx=10, pady=10, sticky="w",                ipadx=0, ipady=0)
-g_22.grid(row=1, column=1, padx=10, pady=10, sticky="w",                ipadx=0, ipady=0)
-g_23.grid(row=1, column=2, padx=10, pady=10, sticky="w",                ipadx=0, ipady=0)
-g_24.grid(row=1, column=3, padx=10, pady=10, sticky="ew", columnspan=2, ipadx=0, ipady=0)
-g_31.grid(row=2, column=0, padx=10, pady=10, sticky="w",                ipadx=0, ipady=0)
-g_32.grid(row=2, column=1, padx=10, pady=10, sticky="w",                ipadx=0, ipady=0)
-g_33.grid(row=2, column=2, padx=10, pady=10, sticky="w",                ipadx=0, ipady=0)
-g_34.grid(row=2, column=3, padx=10, pady=10, sticky="ew", columnspan=2, ipadx=0, ipady=0)
-g_41.grid(row=3, column=0, padx=10, pady=10, sticky="w",                ipadx=0, ipady=0)
-g_42.grid(row=3, column=1, padx=10, pady=10, sticky="w",                ipadx=0, ipady=0)
-g_43.grid(row=3, column=2, padx=10, pady=10, sticky="w",                ipadx=0, ipady=0)
-g_44.grid(row=3, column=3, padx=10, pady=10, sticky="w",                ipadx=0, ipady=0)
-g_45.grid(row=3, column=4, padx=10, pady=10, sticky="w",                ipadx=0, ipady=0)
-g_51.grid(row=4, column=0, padx=10, pady=10, sticky="e",                ipadx=0, ipady=0)
-g_52.grid(row=4, column=1, padx=10, pady=10, sticky="w",                ipadx=0, ipady=0)
-g_61.grid(row=5, column=0, padx=10, pady=10, sticky="e",  columnspan=2, ipadx=0, ipady=0)
-g_63.grid(row=5, column=2, padx=10, pady=10, sticky="e",  columnspan=3, ipadx=0, ipady=0)
-g_71.grid(row=6, column=0, padx=10, pady=10, sticky="ew", columnspan=5, ipadx=0, ipady=0)
+g_51 = tk.Label(root, text="Last run:", width=8)
+g_52 = tk.Label(root, text="---", anchor="w", width=28)
+
+g_61 = tk.Button(root, text="Delete", width=8, command=delete_task)
+g_63 = tk.Button(root, text="Save", width=8, command=add_schedule_to_file)
+
+g_71 = tk.Text(root, height=4, width=72)
+
+g_11.grid(row=0, column=0, padx=10, pady=10, sticky="w", columnspan=2)
+g_13.grid(row=0, column=2, padx=10, pady=10, sticky="w")
+g_14.grid(row=0, column=3, padx=10, pady=10, sticky="ew", columnspan=2)
+
+g_21.grid(row=1, column=0, padx=10, pady=10, sticky="w")
+g_22.grid(row=1, column=1, padx=10, pady=10, sticky="w")
+
+g_23.grid(row=1, column=2, padx=10, pady=10, sticky="w")
+g_24.grid(row=1, column=3, padx=10, pady=10, sticky="ew", columnspan=2)
+
+g_31.grid(row=2, column=0, padx=10, pady=10, sticky="w")
+g_32.grid(row=2, column=1, padx=10, pady=10, sticky="w")
+
+g_33.grid(row=2, column=2, padx=10, pady=10, sticky="w")
+g_34.grid(row=2, column=3, padx=10, pady=10, sticky="ew", columnspan=2)
+
+g_41.grid(row=3, column=0, padx=10, pady=10, sticky="w")
+g_42.grid(row=3, column=1, padx=10, pady=10, sticky="w")
+
+g_43.grid(row=3, column=2, padx=10, pady=10, sticky="w")
+g_44.grid(row=3, column=3, padx=10, pady=10, sticky="w")
+g_45.grid(row=3, column=4, padx=10, pady=10, sticky="w")
+
+g_51.grid(row=4, column=0, padx=10, pady=10, sticky="e")
+g_52.grid(row=4, column=1, padx=10, pady=10, sticky="w")
+
+g_61.grid(row=5, column=0, padx=10, pady=10, sticky="e", columnspan=2)
+g_63.grid(row=5, column=2, padx=10, pady=10, sticky="e", columnspan=3)
+
+g_71.grid(row=6, column=0, padx=10, pady=10, sticky="ew", columnspan=5)
 
 
+# ----------------------------
+# Start-up behavior:
+# 1) Load schedules
+# 2) Catch up missed tasks ON OPEN
+# 3) Start UI auto-refresh
+# 4) Start scheduler loop
+# ----------------------------
+def startup_catch_up():
+    try:
+        schedules = read_json_list(SCHEDULE_FILE)
+    except Exception:
+        return
+
+    schedules, changed = catch_up_missed_tasks(schedules)
+    if changed:
+        try:
+            atomic_write_json(SCHEDULE_FILE, schedules)
+        except Exception as e:
+            log_line(f"Failed to write catch-up updates: {e}")
 
 
-# --- Running ---
-
-# Load schedule
-schedule = []
-sel_task = None
 load_schedules()
+startup_catch_up()          # <-- runs missed tasks once, advances next_run as if never missed
+load_schedules()            # reload list after catch-up changes
+refresh_selected_task_ui()  # keeps g_32/g_52 current
+scheduler.start()
 
-
-
-
-
-
-# Minimize to tray when user clicks the window close (X)
 root.protocol("WM_DELETE_WINDOW", minimize_to_tray)
 
-# Optional: Minimize to tray when user hits the minimize button
-def on_minimize(event):
-    # 'iconic' means minimized
+def on_minimize(_event):
     if root.state() == "iconic":
         minimize_to_tray()
 
 root.bind("<Unmap>", on_minimize)
 
-# --- Start GUI ---
 root.mainloop()
