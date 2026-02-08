@@ -5,14 +5,16 @@
 Python task scheduler with GUI.
 Resides in system tray and runs python scripts based on Daily / Weekly and Monthly frequency.
 
-### Version: 1.0
+### Version: 2.1
 
 ## What works:
 - GUI
 - adding and deleting tasks
+- scheduler
+- running missed tasks while opening
 
 ## ToDo:
-- running tasks
+- update documentation
 
 ## Tested with Python 3.13
 
