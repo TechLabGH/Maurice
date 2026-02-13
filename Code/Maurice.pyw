@@ -12,6 +12,7 @@ from tkinter import END, ttk, filedialog, messagebox
 from pystray import Icon, Menu, MenuItem
 from PIL import Image, ImageTk
 
+import ctypes
 
 # ----------------------------
 # Constants / Files
@@ -122,6 +123,44 @@ def run_script(filepath: str) -> None:
     except Exception as e:
         log_line(f"Failed to start {filepath}: {e}")
 
+# ----------------------------
+# Anti-lock: move mouse a tiny bit every minute
+# ----------------------------
+def _get_mouse_pos() -> tuple[int, int]:
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    pt = POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return int(pt.x), int(pt.y)
+
+
+def _set_mouse_pos(x: int, y: int) -> None:
+    ctypes.windll.user32.SetCursorPos(int(x), int(y))
+
+
+def start_mouse_jiggler(interval_seconds: int = 60) -> threading.Event:
+    """
+    Moves the mouse cursor by 1px and back every `interval_seconds`.
+    Returns a stop Event you can set() when exiting.
+    Windows only (uses user32).
+    """
+    stop_evt = threading.Event()
+
+    def _loop():
+        while not stop_evt.is_set():
+            try:
+                x, y = _get_mouse_pos()
+                _set_mouse_pos(x + 1, y)
+                _set_mouse_pos(x, y)
+            except Exception as e:
+                log_line(f"Mouse jiggler error: {e}")
+
+            stop_evt.wait(interval_seconds)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return stop_evt
 
 # ----------------------------
 # Catch-up missed tasks (ON OPEN)
@@ -290,6 +329,11 @@ def minimize_to_tray():
 
         try:
             root.after(0, root.destroy)
+        except Exception:
+            pass
+
+        try:
+            mouse_jiggler_stop.set()
         except Exception:
             pass
 
@@ -681,6 +725,7 @@ load_schedules()
 startup_catch_up()          # <-- runs missed tasks once, advances next_run as if never missed
 load_schedules()            # reload list after catch-up changes
 refresh_selected_task_ui()  # keeps g_32/g_52 current
+mouse_jiggler_stop = start_mouse_jiggler(60) # moves mouse every minute to prevent lock/sleep
 scheduler.start()
 
 root.protocol("WM_DELETE_WINDOW", minimize_to_tray)

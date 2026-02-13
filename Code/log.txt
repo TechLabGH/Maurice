@@ -1,0 +1,2 @@
+[2026-02-13 11:25:35] Mouse jiggler: moved cursor (keep-awake).
+[2026-02-13 11:26:37] Mouse jiggler: moved cursor (keep-awake).
